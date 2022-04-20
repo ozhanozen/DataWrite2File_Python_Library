@@ -40,9 +40,7 @@ class DataWrite2File_Python:
         self.__nVAR = nVar
         self.__MODE = "w+"
         # Vectors for recent values and buffers.
-        self.RECENT_VALUES = np.ndarray(shape=(nVar,1), dtype=float)
-        self.__BUFFER_1 = np.ndarray(shape=(nVar,self.__BUFFER_SIZE), dtype=float)
-        self.__BUFFER_2 = np.ndarray(shape=(nVar,self.__BUFFER_SIZE), dtype=float)
+        self.RECENT_VALUES = np.zeros(shape=(nVar,1), dtype=float)
         # Buffer pointer.
         self.__BUFFER_COUNTER = 0
         # Close Flag.
@@ -59,149 +57,167 @@ class DataWrite2File_Python:
         self.__HEADER_ON = True
         self.__SAFE_SAVE = False
         self.__DEBUG = False
+
         # Mutex for buffer threads.
-        self.__LOCK = threading.Lock()
-        self.__LOCK.acquire()
+        self.__RECORD_LOCK = threading.Lock()
+        self.__WRITE_LOCK = threading.Lock()
 
         # Run the "run" code
         self.run()
 
     def run(self):
         # Open the threads.
-        self.__W2F_OBJECT_1 = threading.Thread(target=self.__Write_1)
-        self.__W2F_OBJECT_2 = threading.Thread(target=self.__Write_2)
+        self.__W2F_OBJECT_1 = threading.Thread(target=self.__LOGGER_LOOP,args = (1,))
+        self.__W2F_OBJECT_2 = threading.Thread(target=self.__LOGGER_LOOP,args = (2,))
 
 
 
     # Private functions.
 
-    # Thread 1
-    def __Write_1(self):
-        RECORDING = False
-        while self.__WRITING_FLAG:
-            RECORDING = True
-            TIME_START = time.time()
+    # Main function for the threads
+    def __LOGGER_LOOP(self, threadN):
 
-            # The value before pointer, for comparision to check if the data is changed or not.
-            if (self.__BUFFER_COUNTER == 0):
-                index = self.__BUFFER_SIZE - 1
-            else:
-                index = self.__BUFFER_COUNTER - 1
+        BUFFER = np.ndarray(shape=(self.__nVAR,self.__BUFFER_SIZE), dtype=float)
+
+        # Main loop
+        while self.__WRITING_FLAG:
+
+            LAST_RECORDED_BUFFER_INDEX = self.__RECORD(BUFFER,threadN)
+            self.__WRITE(BUFFER,LAST_RECORDED_BUFFER_INDEX,threadN) # Write up to LAST_RECORDED_BUFFER_INDEX
+
+        if (self.__DEBUG == True):
+            print("The thread "+ str(threadN) + " is closed.", flush=True)
+
+    # Data recording to buffer
+    def __RECORD(self, BUFFER, threadN):
+
+        # Acquire the lock, wait here if lock is already acquired.
+        self.__RECORD_LOCK.acquire()
+
+        LAST_RECORDED_BUFFER_INDEX = self.__RecordLoop(threadN, BUFFER)
+
+        # Release the lock when done
+        if self.__RECORD_LOCK.locked():
+            self.__RECORD_LOCK.release()
+
+        return LAST_RECORDED_BUFFER_INDEX
+
+    # Writing buffer to CSV
+    def __WRITE(self, BUFFER, LAST_RECORDED_BUFFER_INDEX, threadN):
+
+        if LAST_RECORDED_BUFFER_INDEX > -1: # If data recording is performed for at least one step
+            
+            # Acquire the lock, wait here if lock is already acquired.
+            self.__WRITE_LOCK.acquire()
+
+            self.__WriteLoop(threadN, LAST_RECORDED_BUFFER_INDEX + 1, BUFFER) # No need to interrupt the loop, so it is inside the function
+
+            # Release the lock when done
+            if self.__WRITE_LOCK.locked():
+                self.__WRITE_LOCK.release()
+
+    # Function that loops over the buffer for recording
+    def __RecordLoop(self, threadN, BUFFER):
+
+        self.__BUFFER_COUNTER = 0
+        LAST_RECORDED_BUFFER_INDEX = -1
+
+        # Record to buffer until the class is closed or buffer is full
+        while self.__WRITING_FLAG: 
+
+            TIME_START = time.time()
+            pIndex = self.__returnPindex() # Index before the BUFFER_COUNTER (circular)
 
             # If the data is changed (or you set this feature off)
-            if ( not(self.RECENT_VALUES[0] == self.__BUFFER_1[0,index]) or self.__TIME_CHECK == False ):
+            if ( not(self.RECENT_VALUES[0] == BUFFER[0,pIndex]) or self.__TIME_CHECK == False ):
+                self.__updateBuffer(BUFFER)
+                LAST_RECORDED_BUFFER_INDEX = self.__BUFFER_COUNTER - 1
 
-                # Update buffer
-                for i in range(0, self.__nVAR):
-                    self.__BUFFER_1[i, self.__BUFFER_COUNTER] = self.RECENT_VALUES[i]
-                self.__BUFFER_COUNTER = self.__BUFFER_COUNTER + 1
+            # Exit if buffer is full
+            if (self.__BUFFER_COUNTER >= self.__BUFFER_SIZE):
+                break
+            
+            # Wait for the loop to finish
+            self.__wait4periodEnd(threadN,TIME_START)
 
-                # If buffer is full, release the other thread first, then start writing, then lock yourself.
-                if (self.__BUFFER_COUNTER >= self.__BUFFER_SIZE):
-                    self.__BUFFER_COUNTER = 0
-                    RECORDING = False
-                    self.__LOCK.release()
-                    self.__WriteLine(1, self.__BUFFER_SIZE)
-                    self.__LOCK.acquire()
+        return LAST_RECORDED_BUFFER_INDEX
 
-            # If you finished before (since you did not update?) then wait for a while, dont overload processor.
-            TIME_END = time.time()
-            if ((TIME_END - TIME_START) < self.__PERIOD):
-                time.sleep(self.__PERIOD - (TIME_END - TIME_START))
-            else:
-                if ( (self.__DEBUG == True and not (self.__BUFFER_COUNTER == 0) ) and (self.__WRITING_FLAG) ):
-                    print("Writing period is violated.")
-        # Write also the not-full buffer when you are done.
-        if ( not(self.__BUFFER_COUNTER ==0) and (RECORDING==True) ):
-            self.__WriteLine(1, self.__BUFFER_COUNTER)
-        if (self.__DEBUG == True):
-            print("The W2File thread 1 was closed.")
+    # The value before pointer, for comparision to check if the data is changed or not.
+    def __returnPindex(self):
+        
+        if (self.__BUFFER_COUNTER == 0):
+            pIndex = self.__BUFFER_SIZE - 1
+        else:
+            pIndex = self.__BUFFER_COUNTER - 1
 
-    # Thread 2. Almost the same, so no comments again.
-    def __Write_2(self):
-        # Start locked. The other thread starts first.
-        self.__LOCK.acquire()
-        RECORDING = False
-        while self.__WRITING_FLAG:
-            RECORDING = True
-            TIME_START = time.time()
+        return pIndex
 
-            if (self.__BUFFER_COUNTER == 0):
-                index = self.__BUFFER_SIZE - 1
-            else:
-                index = self.__BUFFER_COUNTER - 1
+    # Recording: Updating the buffer
+    def __updateBuffer(self,BUFFER):
 
-            if (not (self.RECENT_VALUES[0] == self.__BUFFER_2[0, index]) or self.__TIME_CHECK == False):
-
-                for i in range(0, self.__nVAR):
-                    self.__BUFFER_2[i, self.__BUFFER_COUNTER] = self.RECENT_VALUES[i]
-                self.__BUFFER_COUNTER = self.__BUFFER_COUNTER + 1
-
-                if (self.__BUFFER_COUNTER >= self.__BUFFER_SIZE):
-                    self.__BUFFER_COUNTER = 0
-                    RECORDING = False
-                    self.__LOCK.release()
-                    self.__WriteLine(2, self.__BUFFER_SIZE)
-                    self.__LOCK.acquire()
-
-            TIME_END = time.time()
-            if ((TIME_END - TIME_START) < self.__PERIOD):
-                time.sleep(self.__PERIOD - (TIME_END - TIME_START))
-            else:
-                if ( (self.__DEBUG == True and not (self.__BUFFER_COUNTER == 0)) and (self.__WRITING_FLAG) ):
-                    print("Writing period is violated.")
-        if ( not(self.__BUFFER_COUNTER ==0) and (RECORDING==True) ):
-            self.__WriteLine(2, self.__BUFFER_COUNTER)
-        if (self.__DEBUG == True):
-            print("The W2File thread 2 was closed.")
-
-    # Writes the header in the beginning if the setting is on.
-    def __Write_Header(self,):
-        if (self.__HEADER_ON == True):
-            self.__FILE_OBJECT.write("Experimental data file created by " + self.__AUTHOR_NAME + " at "+ datetime.datetime.now().strftime("%H:%M") + " on "+ datetime.datetime.now().strftime("%d.%m.%Y.") + "\n \n" )
-
-    # Writes variable names.
-    def __WriteNames(self,):
         for i in range(0, self.__nVAR):
-            if (i < self.__nVAR - 1):
-                self.__FILE_OBJECT.write(self.__VAR_NAMES[i] + " , ")
-            else:
-                self.__FILE_OBJECT.write(self.__VAR_NAMES[i] + "\n")
+            BUFFER[i, self.__BUFFER_COUNTER] = self.RECENT_VALUES[i]
 
-    # Function that writes the variables in rows.
-    def __WriteLine(self, Thread_Number, WriteSize):
+        self.__BUFFER_COUNTER = self.__BUFFER_COUNTER + 1
+
+    # If you finished before (since you did not update?) then wait for a while, dont overload processor.
+    def __wait4periodEnd(self,threadN,TIME_START):
+
+        TIME_END = time.time()
+
+        if ((TIME_END - TIME_START) < self.__PERIOD):
+            time.sleep(self.__PERIOD - (TIME_END - TIME_START))
+        else:
+            if ( (self.__DEBUG == True and not (self.__BUFFER_COUNTER == 0) ) and (self.__WRITING_FLAG) ):
+                print("Writing period is violated (thread "+str(threadN)+"): " + str((TIME_END - TIME_START)) + "s", flush=True)
+
+    # Function that writes the variables to a csv file in rows.
+    def __WriteLoop(self, threadN, WriteSize, BUFFER):
+
         # If SafeSafe is on, you open and close the function before/after writing.
         if (self.__SAFE_SAVE == True):
             self.__FILE_OBJECT = open(self.__FILE_PATH, "a+")
 
-        if (Thread_Number == 1):
-            for i in range(0, WriteSize):
-                for k in range(0, self.__nVAR):
-                    if (k < self.__nVAR - 1):
-                        self.__FILE_OBJECT.write(str(self.__BUFFER_1[k, i]) + " , ")
+        for i in range(0, WriteSize):
+            for k in range(0, self.__nVAR):
+                if (k < self.__nVAR - 1):
+                    self.__FILE_OBJECT.write(str(BUFFER[k, i]) + " , ")
+                else:
+                    if (self.__DEBUG == True):
+                        self.__FILE_OBJECT.write(str(BUFFER[k, i]) + " , " + str(threadN)+ " , "+ str(self.__WRITING_FLAG) + " , " + str(i) + " \n")
                     else:
-                        self.__FILE_OBJECT.write(str(self.__BUFFER_1[k, i]) + "\n")
-                    time.sleep(self.__PERIOD / self.__BUFFER_SIZE / self.__WRITE_RELAXER)
-        elif(Thread_Number == 2):
-            for i in range(0, WriteSize):
-                for k in range(0, self.__nVAR):
-                    if (k < self.__nVAR - 1):
-                        self.__FILE_OBJECT.write(str(self.__BUFFER_2[k, i]) + " , ")
-                    else:
-                        self.__FILE_OBJECT.write(str(self.__BUFFER_2[k, i]) + "\n")
-                    time.sleep(self.__PERIOD / self.__BUFFER_SIZE / self.__WRITE_RELAXER)
-        else:
-            print("Error in Thread_Number")
+                        self.__FILE_OBJECT.write(str(BUFFER[k, i]) + " \n")
+                time.sleep(self.__PERIOD / self.__BUFFER_SIZE / self.__WRITE_RELAXER)
+       
         # If SafeSafe is on, you open and close the function before/after writing.
-        if (self.__SAFE_SAVE == True):
+        if (self.__SAFE_SAVE == True and self.__WRITING_FLAG == True):
             self.__FILE_OBJECT.close()
 
+    # Writes the header in the beginning if the setting is on.
+    def __Write_Header(self,):
 
+        if (self.__HEADER_ON == True):
+            self.__FILE_OBJECT.write("Data file created by " + self.__AUTHOR_NAME + " at "+ datetime.datetime.now().strftime("%H:%M") + " on "+ datetime.datetime.now().strftime("%d.%m.%Y.") + "\n \n" )
+
+    # Writes variable names.
+    def __WriteNames(self,):
+
+        for i in range(0, self.__nVAR):
+            if (i < self.__nVAR - 1):
+                self.__FILE_OBJECT.write(self.__VAR_NAMES[i] + " , ")
+            else:
+                if (self.__DEBUG == True):
+                    self.__FILE_OBJECT.write(self.__VAR_NAMES[i] + " , ThreadN , WritingFlag , BufferIndex\n")
+                else:
+                    self.__FILE_OBJECT.write(self.__VAR_NAMES[i] + "\n")
+
+    
 
     # Public functions.
 
     # Sets the setting which allows you to continue a file (same name) or overwrite the file.
     def Set_Append(self, True_False):
+
         if (True_False == True):
             self.__MODE = "a+"
         elif (True_False == False):
@@ -209,8 +225,9 @@ class DataWrite2File_Python:
         else:
             print("Wrong boolean input for Set_Append")
 
-    # Sets the period. Cannot be lower than 0.25. No guarantee though.
+    # Sets the period in ms. Cannot be lower than 0.25 ms. No guarantee though.
     def Set_Period(self, Period):
+
         if Period < 0.25:
             print("Period size cannot be smaller than 0.25 ms, therefore is set to 0.25 ms")
             self.__PERIOD = 0.25 / 1000
@@ -219,6 +236,7 @@ class DataWrite2File_Python:
 
     # Do you wanna see period violations? Turn this on.
     def Set_Debug(self, Debug):
+
         if (Debug == True):
             self.__DEBUG = True
         elif (Debug == False):
@@ -228,6 +246,7 @@ class DataWrite2File_Python:
 
     # Open/Close the file each time data is written.
     def Set_SafeSave(self, True_False):
+
         if (True_False == True):
             self.__SAFE_SAVE = True
         elif (True_False == False):
@@ -237,6 +256,7 @@ class DataWrite2File_Python:
 
     # If you first variable is time, this is useful. If not, disable this feature.
     def Set_TimeCheck(self, True_False):
+
         if (True_False == True):
             self.__TIME_CHECK = True
         elif (True_False == False):
@@ -246,6 +266,7 @@ class DataWrite2File_Python:
 
     # Disable if you dont want header.
     def Set_Header_On(self, True_False):
+
         if (True_False == True):
             self.__HEADER_ON = True
         elif (True_False == False):
@@ -255,6 +276,7 @@ class DataWrite2File_Python:
 
     # Sets custom folder to put the data.
     def Set_Folder(self, Path):
+
         if (Path.endswith('/')):
             self.__FOLDER_PATH = Path
         else:
@@ -262,12 +284,12 @@ class DataWrite2File_Python:
 
     # Close the file when you are done.
     def Close_W2File(self):
+
+        print("Closing the logger.", flush=True)
         self.__WRITING_FLAG = False
-        self.__LOCK.release()
         self.__W2F_OBJECT_1.join()
         self.__W2F_OBJECT_2.join()
-        if (self.__SAFE_SAVE == False):
-            self.__FILE_OBJECT.close()
+        self.__FILE_OBJECT.close()
 
     # Start writing the file.
     def Start_Writing(self,):
